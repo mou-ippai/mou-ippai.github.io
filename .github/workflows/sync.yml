@@ -6,10 +6,17 @@ permissions:
   contents: write
 jobs:
   sync:
-    if: github.repository == 'mou-ippai/mou-ippai.github.io'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          git fetch https://github.com/tfd0313-lang/mou-ippai deploy
-          git push --force origin FETCH_HEAD:refs/heads/main
+      - name: replace site files
+        run: |
+          set -e
+          git fetch --depth=1 https://github.com/tfd0313-lang/mou-ippai deploy
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
+          git checkout FETCH_HEAD -- .
+          git add -A
+          git config user.name  sync
+          git config user.email sync@users.noreply.github.com
+          git commit -q -m "sync $(git rev-parse --short FETCH_HEAD)" || exit 0
+          git push origin HEAD:main
