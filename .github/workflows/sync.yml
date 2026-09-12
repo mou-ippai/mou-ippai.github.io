@@ -1,0 +1,15 @@
+name: sync
+on:
+  schedule: [{cron: '*/30 * * * *'}]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    if: github.repository == 'mou-ippai/mou-ippai.github.io'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git fetch https://github.com/tfd0313-lang/mou-ippai deploy
+          git push --force origin FETCH_HEAD:refs/heads/main
