@@ -419,7 +419,7 @@ button{touch-action:manipulation}
     <div id="levels" role="group" aria-label="レベル一覧" hidden></div>
     <button id="startBtn">はじめる</button>
     <div id="homeBest"></div>
-    <div id="ver">prototype v3.27 — 液体の描き直し</div>
+    <div id="ver">prototype v3.32 — EXはボタンでも傾ける</div>
   </div>
 
   <!-- ゲーム -->
@@ -1099,8 +1099,10 @@ Save.load();
    気泡層 + 低域ゴボゴボ + 高域シュワ + 水位で上がる容器共鳴の4層。 */
 const Snd = {
   ctx:null, master:null,
-  gStream:null, fStream:null,      // ストリームの乱流
-  gCav:null, fCav:null,            // 容器の共鳴(水位で上がる)
+  bus:null,                        // 注ぎの音のまとめ口
+  gStream:null, fStream:null,      // しぶき(乱流)
+  gGurg:null, fGurg:null,          // ごぼごぼ
+  gCav:null, fCav:null, gCav2:null, fCav2:null,   // 容器の共鳴(水位で上がる)
   _glugAt:0, _crackAt:0, _bubAt:0,
   amb:null,                        // ホーム画面の店の空気(合成。音源ファイルは持たない)
   init(){
@@ -1120,40 +1122,78 @@ const Snd = {
       const loopNoise=()=>{
         const s=this.ctx.createBufferSource(); s.buffer=this.noiseBuf; s.loop=true; s.start(); return s;
       };
-      // 落下するビールが液面を叩く乱流ノイズ
+      /* 注ぎの音は全部ここの配線で鳴る。要点は「乱流で揺らすこと」。
+         ノイズをフィルタに通しただけだと「サー」という定常音になり、
+         合成音だとすぐ分かる。実際の流れは不規則に強まったり弱まったりする
+         ので、白ノイズの低域だけを取り出した揺らぎ信号で音量を動かす */
+      const ctl=(hz,amt)=>{
+        const f=this.ctx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=hz; f.Q.value=0.7;
+        const g=this.ctx.createGain(); g.gain.value=amt;
+        loopNoise().connect(f).connect(g); return g;
+      };
+      /* 注ぎの音のまとめ口。スピーカーで刺さらないよう上を丸める */
+      this.bus=this.ctx.createGain(); this.bus.gain.value=1.9;   // 揺らぎで平均が下がるぶんを戻す
+      const tone=this.ctx.createBiquadFilter(); tone.type='lowpass'; tone.frequency.value=7200; tone.Q.value=0.5;
+      this.bus.connect(tone).connect(this.master);
+      const chain=(filter,base,ctlHz,ctlAmt)=>{
+        const m=this.ctx.createGain(); m.gain.value=base;         // 揺らぎで動く段
+        ctl(ctlHz,ctlAmt).connect(m.gain);
+        const g=this.ctx.createGain(); g.gain.value=0;            // 流量で動く段
+        loopNoise().connect(filter).connect(m).connect(g).connect(this.bus);
+        return g;
+      };
+      // しぶき: 落ちた液が液面を叩く高めの帯
       this.fStream=this.ctx.createBiquadFilter();
-      this.fStream.type='bandpass'; this.fStream.frequency.value=1400; this.fStream.Q.value=0.5;
-      this.gStream=this.ctx.createGain(); this.gStream.gain.value=0;
-      loopNoise().connect(this.fStream).connect(this.gStream).connect(this.master);
-      // グラス内の空気柱共鳴。液面が上がるほど高くなる=満杯が耳で分かる
+      this.fStream.type='bandpass'; this.fStream.frequency.value=1500; this.fStream.Q.value=0.9;
+      this.gStream=chain(this.fStream,0.55,7,22);
+      // ごぼごぼ: 中低の帯。液の塊が入るときの音
+      this.fGurg=this.ctx.createBiquadFilter();
+      this.fGurg.type='bandpass'; this.fGurg.frequency.value=480; this.fGurg.Q.value=1.3;
+      this.gGurg=chain(this.fGurg,0.5,11,30);
+      // グラス内の空気柱共鳴。液面が上がるほど高くなる=満杯が耳で分かる。
+      // 基音と、その上の倍音を1本。倍音があると筒の鳴りに聞こえる
       this.fCav=this.ctx.createBiquadFilter();
-      this.fCav.type='bandpass'; this.fCav.frequency.value=200; this.fCav.Q.value=7;
-      this.gCav=this.ctx.createGain(); this.gCav.gain.value=0;
-      loopNoise().connect(this.fCav).connect(this.gCav).connect(this.master);
+      this.fCav.type='bandpass'; this.fCav.frequency.value=200; this.fCav.Q.value=11;
+      this.gCav=chain(this.fCav,0.6,5,18);
+      this.fCav2=this.ctx.createBiquadFilter();
+      this.fCav2.type='bandpass'; this.fCav2.frequency.value=474; this.fCav2.Q.value=7;
+      this.gCav2=chain(this.fCav2,0.6,6,18);
+      this._pouring=false;
     }catch(e){}
   },
   resume(){ if(this.ctx&&this.ctx.state!=='running'){ try{ this.ctx.resume().catch(()=>{}); }catch(e){} } },
 
-  /* 瓶口から空気が入る「ゴボッ」。連続ノイズではなく離散パルスで鳴らす */
+  /* 瓶口から空気が入る「トクッ」。サイン波を鳴らすと電子音になる。
+     実物は瓶の中の空気が短く共鳴する音なので、ノイズの短い塊を鋭い
+     バンドパスに通して作る。音程は空気が入るにつれ少し下がる */
   glug(nf){
-    const t=this.ctx.currentTime;
-    const dur=0.13+Math.random()*0.07;
-    const f0=90+Math.random()*45+nf*30;
-    const o=this.ctx.createOscillator(), g=this.ctx.createGain();
-    o.type='sine';
-    o.frequency.setValueAtTime(f0*1.5,t);
-    o.frequency.exponentialRampToValueAtTime(f0,t+dur*0.8);
+    const ctx=this.ctx, t=ctx.currentTime;
+    const dur=0.11+Math.random()*0.09;
+    const f0=(130+Math.random()*70)*(1+nf*0.25);
+    const s=ctx.createBufferSource(); s.buffer=this.noiseBuf;
+    s.playbackRate.value=0.7+Math.random()*0.5;
+    const bp=ctx.createBiquadFilter(); bp.type='bandpass'; bp.Q.value=13;
+    bp.frequency.setValueAtTime(f0*1.45,t);
+    bp.frequency.exponentialRampToValueAtTime(f0,t+dur*0.7);
+    const g=ctx.createGain();
     g.gain.setValueAtTime(0.0001,t);
-    g.gain.exponentialRampToValueAtTime(0.16+nf*0.10,t+0.012);
-    g.gain.exponentialRampToValueAtTime(0.0008,t+dur);
-    o.connect(g).connect(this.master); o.start(t); o.stop(t+dur+0.03);
-    // ゴボッに混ざる短い破裂ノイズ
-    const s=this.ctx.createBufferSource(); s.buffer=this.noiseBuf;
-    s.playbackRate.value=0.6+Math.random()*0.5;
-    const bf=this.ctx.createBiquadFilter(); bf.type='bandpass'; bf.frequency.value=420; bf.Q.value=1.4;
-    const bg=this.ctx.createGain();
-    bg.gain.setValueAtTime(0.10,t); bg.gain.exponentialRampToValueAtTime(0.0006,t+0.09);
-    s.connect(bf).connect(bg).connect(this.master); s.start(t); s.stop(t+0.12);
+    g.gain.exponentialRampToValueAtTime(1.6*(0.6+nf*0.5),t+0.008);
+    g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+    s.connect(bp).connect(g).connect(this.bus); s.start(t); s.stop(t+dur+0.05);
+    // 芯。共鳴の底を支える低い成分。小さく
+    const o=ctx.createOscillator(), g2=ctx.createGain(); o.type='sine';
+    o.frequency.setValueAtTime(f0*1.35,t);
+    o.frequency.exponentialRampToValueAtTime(f0*0.95,t+dur*0.8);
+    g2.gain.setValueAtTime(0.0001,t);
+    g2.gain.exponentialRampToValueAtTime(0.07+nf*0.05,t+0.008);
+    g2.gain.exponentialRampToValueAtTime(0.0008,t+dur);
+    o.connect(g2).connect(this.bus); o.start(t); o.stop(t+dur+0.03);
+    // 瓶口で液が切れる短いクリック
+    const c=ctx.createBufferSource(); c.buffer=this.noiseBuf; c.playbackRate.value=1.6;
+    const hp=ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=1800;
+    const g3=ctx.createGain();
+    g3.gain.setValueAtTime(0.09,t); g3.gain.exponentialRampToValueAtTime(0.001,t+0.014);
+    c.connect(hp).connect(g3).connect(this.bus); c.start(t); c.stop(t+0.03);
   },
   /* 泡の炭酸がはじける音。ビールらしさの決め手。泡量に比例して鳴らす */
   crackle(amount){
@@ -1162,60 +1202,82 @@ const Snd = {
     const s=this.ctx.createBufferSource(); s.buffer=this.noiseBuf;
     s.playbackRate.value=1.4+Math.random()*1.4;
     const f=this.ctx.createBiquadFilter();
-    f.type='bandpass'; f.frequency.value=3600+Math.random()*5200; f.Q.value=3+Math.random()*4;
+    f.type='bandpass'; f.frequency.value=3200+Math.random()*4800; f.Q.value=3+Math.random()*4;
     const g=this.ctx.createGain();
-    g.gain.setValueAtTime((0.05+Math.random()*0.10)*amount,t);
+    g.gain.setValueAtTime((0.04+Math.random()*0.09)*amount,t);
     g.gain.exponentialRampToValueAtTime(0.0004,t+dur);
-    s.connect(f).connect(g).connect(this.master); s.start(t); s.stop(t+dur+0.02);
+    s.connect(f).connect(g).connect(this.bus); s.start(t); s.stop(t+dur+0.02);
   },
   /* 液中を上る気泡: 音程が上がりながら消えるチャープ(液体音の物理モデル) */
   bubble(fill){
     const t=this.ctx.currentTime+Math.random()*0.02;
-    const dur=0.025+Math.random()*0.05;
-    const f0=(500+Math.random()*Math.random()*2000)*(1+fill*0.3);
+    const dur=0.02+Math.random()*0.05;
+    const f0=(450+Math.random()*Math.random()*2200)*(1+fill*0.3);
     const o=this.ctx.createOscillator(), g=this.ctx.createGain();
     o.type='sine';
     o.frequency.setValueAtTime(f0,t);
-    o.frequency.exponentialRampToValueAtTime(f0*1.5,t+dur);
-    g.gain.setValueAtTime(0.010+Math.random()*0.022,t);
+    o.frequency.exponentialRampToValueAtTime(f0*1.4,t+dur);
+    g.gain.setValueAtTime(0.006+Math.random()*0.016,t);
     g.gain.exponentialRampToValueAtTime(0.0004,t+dur);
-    o.connect(g).connect(this.master); o.start(t); o.stop(t+dur+0.02);
+    o.connect(g).connect(this.bus); o.start(t); o.stop(t+dur+0.02);
+  },
+  /* 注ぎ始め。最初の一撃だけは液面を叩く音が大きく、細かい泡が一斉に立つ */
+  splash(nf){
+    const ctx=this.ctx, t=ctx.currentTime;
+    const s=ctx.createBufferSource(); s.buffer=this.noiseBuf;
+    const bp=ctx.createBiquadFilter(); bp.type='bandpass'; bp.Q.value=0.8;
+    bp.frequency.setValueAtTime(1700,t); bp.frequency.exponentialRampToValueAtTime(650,t+0.18);
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(0.10+nf*0.12,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.2);
+    s.connect(bp).connect(g).connect(this.bus); s.start(t); s.stop(t+0.25);
+    for(let i=0;i<6;i++) setTimeout(()=>this.bubble(0.1), i*22+Math.random()*20);
   },
   /* 毎フレーム: nf=流量0..1 fill=充填率0..1 foam=泡比率0..1 */
   pour(nf,fill,foam,dt){
     if(!this.ctx) return;
     const t=this.ctx.currentTime;
-    this.gStream.gain.setTargetAtTime(nf*0.085,t,0.05);
-    this.fStream.frequency.setTargetAtTime(900+nf*1500,t,0.08);
-    this.gCav.gain.setTargetAtTime(nf*0.30,t,0.05);
-    this.fCav.frequency.setTargetAtTime(170+fill*700,t,0.09);
+    if(!this._pouring && nf>0.08) this.splash(nf);
+    this._pouring = nf>0.02;
+    // 泡が厚いほど液面が覆われて、しぶきも共鳴もくぐもる
+    const damp=1-0.42*foam;
+    this.gStream.gain.setTargetAtTime(nf*0.075*damp,t,0.05);
+    this.fStream.frequency.setTargetAtTime(1100+nf*1500,t,0.08);
+    this.gGurg.gain.setTargetAtTime(nf*0.070*damp,t,0.05);
+    const cav=170+fill*720;
+    this.gCav.gain.setTargetAtTime(nf*0.26*damp*(0.7+0.3*nf),t,0.05);
+    this.fCav.frequency.setTargetAtTime(cav,t,0.09);
+    this.gCav2.gain.setTargetAtTime(nf*0.07*damp,t,0.05);
+    this.fCav2.frequency.setTargetAtTime(cav*2.37,t,0.09);
     if(nf<=0) return;
-    // ゴボゴボ: 流量が多いほど間隔が短い
-    if(t>this._glugAt){ this.glug(nf); this._glugAt=t+(0.30-nf*0.16)*(0.75+Math.random()*0.5); }
+    // トクトク: 流量が多いほど間隔が短い。間隔は毎回ばらす(等間隔だと機械に聞こえる)
+    if(t>this._glugAt){ this.glug(nf); this._glugAt=t+(0.30-nf*0.16)*(0.6+Math.random()*0.8); }
     // 炭酸のはじけ: 泡が多いほど密に
     const crackRate=40+foam*260+nf*60;
     this._crackAt+=dt*crackRate;
     let nc=Math.min(Math.floor(this._crackAt),6); this._crackAt-=nc;
     for(let i=0;i<nc;i++) this.crackle(0.5+foam*0.9);
     // 気泡
-    this._bubAt+=dt*(12+nf*40);
-    let nb=Math.min(Math.floor(this._bubAt),3); this._bubAt-=nb;
+    this._bubAt+=dt*(16+nf*48);
+    let nb=Math.min(Math.floor(this._bubAt),4); this._bubAt-=nb;
     for(let i=0;i<nb;i++) this.bubble(fill);
   },
   /* 注ぎを止めた後も泡がはじけ続ける余韻 */
   settleFizz(foam,dt){
     if(!this.ctx) return;
     const t=this.ctx.currentTime;
+    this._pouring=false;
     this.gStream.gain.setTargetAtTime(0,t,0.06);
+    this.gGurg.gain.setTargetAtTime(0,t,0.06);
     this.gCav.gain.setTargetAtTime(0,t,0.08);
+    this.gCav2.gain.setTargetAtTime(0,t,0.08);
     this._crackAt+=dt*(30+foam*150);
     let nc=Math.min(Math.floor(this._crackAt),4); this._crackAt-=nc;
     for(let i=0;i<nc;i++) this.crackle(0.35+foam*0.6);
   },
   silence(){ if(!this.ctx) return;
     const t=this.ctx.currentTime;
-    this.gStream.gain.setTargetAtTime(0,t,0.05);
-    this.gCav.gain.setTargetAtTime(0,t,0.05);
+    this._pouring=false;
+    for(const g of [this.gStream,this.gGurg,this.gCav,this.gCav2]) g.gain.setTargetAtTime(0,t,0.05);
   },
   blip(f,dur=0.09,type='square',vol=0.12,when=0){ if(!this.ctx) return;
     const t=this.ctx.currentTime+when;
@@ -1627,6 +1689,9 @@ const Input = {
     if(t.listening) return;
     window.addEventListener('deviceorientation',e=>{
       if(e.beta==null) return;
+      // ホーム画面や結果画面では値を捨てる(発熱・電池対策 §20)。購読自体は
+      // 外さない: 外すと再開時に初回イベントを待つ間「センサーなし」と誤判定する
+      if(!el.game.classList.contains('on')) return;
       t.lastEvt=performance.now();
       const b=e.beta==null?t.b:e.beta;
       const g=e.gamma==null?(t.g||0):e.gamma;
@@ -1669,6 +1734,20 @@ Object.keys(CHAR_ART).forEach(id=>{ charaEls[id]=$('ch_'+id); });
 let curChara=charaEls.papa, curPhoto=null;
 const photoEl=$('photoChara');
 let curScene=null, sceneImgs={}, scenePending=false;
+const sceneHand={};                       // キャラID → 指のマスク画像
+/* いま表示している表情の画像から「グラスの手前にある指」だけを切り出した層。
+   表情が変わったときだけ作り直す(毎フレーム作ると重い) */
+function handLayer(chId,img){
+  const m=sceneHand[chId]; if(!m) return null;
+  if(img.__hand && img.__handMask===m) return img.__hand;
+  const c=document.createElement('canvas'); c.width=img.naturalWidth; c.height=img.naturalHeight;
+  const g=c.getContext('2d');
+  g.drawImage(img,0,0);
+  g.globalCompositeOperation='destination-in';
+  g.drawImage(m,0,0,c.width,c.height);
+  img.__hand=c; img.__handMask=m;
+  return c;
+}
 /* キャラの画像は1人ぶんで約470KB。全員を1ファイルに抱えると読み込みが
    実用的でなくなるため、遊ぶレベルのぶんだけ art/<id>.json から取りに行く。
    単一ファイル版(Artifact用)は ART.scene に全部入っており、その場合は
@@ -1691,7 +1770,10 @@ function ensureScene(chId){
         im.onload=()=>res();
         im.onerror=()=>{ delete d.imgs[k]; delete imgs[k]; res(); };
         im.src=d.imgs[k]; imgs[k]=im;
-      }))).then(()=>{ sceneImgs[chId]=imgs; sceneData[chId]=d; sceneFailed[chId]=false; });
+      })).concat(d.hand ? [new Promise(res=>{
+        // グラスを持つ指のマスク(tools/hand_mask.py)。無ければ指はビールの下に沈む
+        const im=new Image(); im.onload=()=>{ sceneHand[chId]=im; res(); }; im.onerror=()=>res(); im.src=d.hand;
+      })] : [])).then(()=>{ sceneImgs[chId]=imgs; sceneData[chId]=d; sceneFailed[chId]=false; });
     })
     .catch(()=>{ sceneFailed[chId]=true; delete sceneLoading[chId]; });
     // 失敗してもSVGのキャラで遊べる。次にこのキャラへ入ったとき取り直す
@@ -2041,9 +2123,10 @@ function swayTrackUpdate(){
   if(!a.total){ G.streamDX=0; return; }
   const sc=CW/390, t=performance.now()/1000, ph=Math.sin(t*Math.PI*2/lvl.sway.period);
   const gx=ph*a.photo;                              // グラスの中心のずれ
-  // 傾けモードで遊んでいる人だけが自分で追う。ボタンで遊んでいる人は瓶が自動で追う
-  // (ボタン操作なのに携帯を傾けないとこぼれる、という理不尽をなくす)
-  const side = Input.mode==='tilt' ? Input.side() : null;
+  // 横の傾きは操作方式に関係なく使う。ボタンで注ぐ人も、EXでは携帯を左右に
+  // 傾けて揺れるグラスを追う(瓶が勝手に追うとEXの意味が無い: オーナー指摘)。
+  // センサーが無い端末だけ、瓶が自動で追う(side() が null)
+  const side = Input.side();
   const range=Math.max(40*sc, a.total*1.15);        // 傾け切ったときの瓶の移動量
   const sx = side==null ? gx : -ph*a.hand + side*range;
   G.streamDX=sx;
@@ -2398,19 +2481,25 @@ const bubblesFx=[], drips=[];
 let foamPat=null;
 function foamPattern(ctx){
   if(foamPat) return foamPat;
-  const S=72, c=document.createElement('canvas'); c.width=c.height=S;
+  const S=112, c=document.createElement('canvas'); c.width=c.height=S;
   const g=c.getContext('2d');
-  for(let i=0;i<420;i++){
-    const r=0.5+Math.random()*Math.random()*2.6;
-    const x=Math.random()*S, y=Math.random()*S;
-    const a=0.05+Math.random()*0.16;
-    g.beginPath(); g.arc(x,y,r,0,Math.PI*2);
-    g.fillStyle= Math.random()<0.55 ? `rgba(255,255,252,${a})` : `rgba(176,158,128,${a*0.8})`;
-    g.fill();
-    if(x<r||y<r||x>S-r||y>S-r){            // 継ぎ目が出ないよう反対側にも置く
-      g.beginPath(); g.arc(x<r?x+S:x>S-r?x-S:x, y<r?y+S:y>S-r?y-S:y, r,0,Math.PI*2); g.fill();
+  // 粒ごとに「上に光・縁に影」を入れる。平らな丸を散らしただけでは点模様になる
+  const bubble=(x,y,r,al)=>{
+    const rg=g.createRadialGradient(x-r*0.35,y-r*0.4,r*0.1, x,y,r);
+    rg.addColorStop(0,`rgba(255,255,255,${al})`);
+    rg.addColorStop(0.55,`rgba(250,244,230,${al*0.35})`);
+    rg.addColorStop(0.88,`rgba(170,148,116,${al*0.55})`);
+    rg.addColorStop(1,`rgba(140,118,88,0)`);
+    g.fillStyle=rg; g.beginPath(); g.arc(x,y,r,0,Math.PI*2); g.fill();
+  };
+  const put=(x,y,r,al)=>{                       // 継ぎ目が出ないよう端は反対側にも置く
+    for(const dx of [0,-S,S]) for(const dy of [0,-S,S]){
+      const xx=x+dx, yy=y+dy;
+      if(xx>-r&&xx<S+r&&yy>-r&&yy<S+r) bubble(xx,yy,r,al);
     }
-  }
+  };
+  for(let i=0;i<90;i++)  put(Math.random()*S,Math.random()*S, 1.8+Math.random()*3.2, 0.42+Math.random()*0.30);
+  for(let i=0;i<420;i++) put(Math.random()*S,Math.random()*S, 0.6+Math.random()*1.6, 0.30+Math.random()*0.35);
   return (foamPat=ctx.createPattern(c,'repeat'));
 }
 /* グラス内側の半幅(高さ位置tで補間: t=0が上端,1が底) */
@@ -2547,9 +2636,11 @@ function renderScene(now){
     sideTo(botY,topY,-1);
     ctx.closePath();};
 
-  // ビール。人物と背景が写実なので、中身も液体として見えるところまで描く。
-  // 効いているのは4つ: たての濃度差、横の減光(ガラスの厚み)、底の反射、
-  // 液面のふち。半透明のままにして、指がグラス前面に写っても馴染ませる
+  // ビール。色を上から塗るのではなく、写真のガラスをビール色に染める(乗算)。
+  // 写真が持っているガラスの反射・厚み・奥の景色がそのまま残るので、
+  // 塗った板ではなく「ガラスの中に液体がある」ように見える。
+  // ただ乗算だけだと暗い服の前では黒く沈んで量が読めないので、薄い地の色を
+  // 先に敷いて明るさの下限を作る
   if(fillL>0.004){
     ctx.save(); clipGlass(); ctx.clip();
     const ys=Math.min(yL+wob,botY);
@@ -2559,36 +2650,57 @@ function renderScene(now){
       surface(botY,-1);                // 底: 手前側の弧(下を通る)
       sideTo(botY,ys,-1);              // 左の壁
       ctx.closePath(); };
-    // たての濃度差。上は光が抜けて明るく、底は液が厚くて濃い
-    const grad=ctx.createLinearGradient(0,ys,0,botY);
-    grad.addColorStop(0,   'rgba(248,184,74,0.62)');
-    grad.addColorStop(0.42,'rgba(226,146,36,0.70)');
-    grad.addColorStop(1,   'rgba(142,78,10,0.80)');
-    ctx.fillStyle=grad; beerPath(); ctx.fill();
-
-    // 横の減光。円筒のガラスは端ほど光の通る道が長く、濃く沈んで見える。
-    // 中ほどに抜けの明るい帯を1本入れると、板ではなく筒に見える
-    const wm=hwAt((ys+botY)/2);
+    const wm=hwAt((ys+botY)/2), midW=Math.max(wm.R-wm.L,1);
+    // 1) 明るさの下限
+    const base=ctx.createLinearGradient(0,ys,0,botY);
+    base.addColorStop(0,  'rgba(248,196,104,0.50)');
+    base.addColorStop(1,  'rgba(206,134,44,0.52)');
+    ctx.fillStyle=base; beerPath(); ctx.fill();
+    // 2) 写真を染める。上は光が抜けて明るい琥珀、底は液が厚くて濃い
+    ctx.globalCompositeOperation='multiply';
+    const dye=ctx.createLinearGradient(0,ys,0,botY);
+    dye.addColorStop(0,   'rgb(255,224,148)');
+    dye.addColorStop(0.45,'rgb(246,190,96)');
+    dye.addColorStop(1,   'rgb(200,130,44)');
+    ctx.fillStyle=dye; beerPath(); ctx.fill();
+    // 3) 横の減光。円筒は端ほど光の通る道が長い
     const hg=ctx.createLinearGradient(wm.L,0,wm.R,0);
-    hg.addColorStop(0,   'rgba(62,30,2,0.42)');
-    hg.addColorStop(0.16,'rgba(62,30,2,0.06)');
-    hg.addColorStop(0.34,'rgba(255,224,160,0.07)');
-    hg.addColorStop(0.48,'rgba(255,228,168,0.10)');
-    hg.addColorStop(0.62,'rgba(255,224,160,0.04)');
-    hg.addColorStop(0.85,'rgba(62,30,2,0.08)');
-    hg.addColorStop(1,   'rgba(62,30,2,0.44)');
+    hg.addColorStop(0,   'rgb(168,128,84)');
+    hg.addColorStop(0.14,'rgb(240,232,222)');
+    hg.addColorStop(0.5, 'rgb(255,255,255)');
+    hg.addColorStop(0.86,'rgb(240,232,222)');
+    hg.addColorStop(1,   'rgb(168,128,84)');
     ctx.fillStyle=hg; beerPath(); ctx.fill();
-
-    // 底で反射した光。底板の少し上に明るい帯が出る
+    // 4) 液の発光。逆光で琥珀が透ける帯と、底で跳ね返る光
+    ctx.globalCompositeOperation='screen';
+    const glow=ctx.createLinearGradient(wm.L,0,wm.R,0);
+    glow.addColorStop(0,   'rgba(255,176,70,0.10)');
+    glow.addColorStop(0.32,'rgba(255,190,86,0.24)');
+    glow.addColorStop(0.52,'rgba(255,206,116,0.32)');
+    glow.addColorStop(0.72,'rgba(255,190,86,0.20)');
+    glow.addColorStop(1,   'rgba(255,176,70,0.10)');
+    ctx.fillStyle=glow; beerPath(); ctx.fill();
     if(botY-ys>16){
-      const bg=ctx.createLinearGradient(0,botY-Math.min(26,(botY-ys)*0.4),0,botY);
-      bg.addColorStop(0,'rgba(255,214,132,0)');
-      bg.addColorStop(0.72,'rgba(255,214,132,0.16)');
-      bg.addColorStop(1,'rgba(120,64,8,0.22)');
+      const bg=ctx.createLinearGradient(0,botY-Math.min(28,(botY-ys)*0.4),0,botY);
+      bg.addColorStop(0,'rgba(255,200,110,0)');
+      bg.addColorStop(0.7,'rgba(255,200,110,0.20)');
+      bg.addColorStop(1,'rgba(255,200,110,0.04)');
       ctx.fillStyle=bg; beerPath(); ctx.fill();
     }
+    // 5) 液の中をゆっくり流れる光の帯。静止画ではなく液体だと分かる動き
+    const t=now/1000;
+    for(let k=0;k<2;k++){
+      const ph=(t*0.09+k*0.5)%1;
+      const x0=wm.L+midW*(ph*1.6-0.3), sl=midW*0.55;
+      const lg=ctx.createLinearGradient(x0,0,x0+sl,0);
+      lg.addColorStop(0,'rgba(255,220,150,0)');
+      lg.addColorStop(0.5,'rgba(255,220,150,0.09)');
+      lg.addColorStop(1,'rgba(255,220,150,0)');
+      ctx.fillStyle=lg; beerPath(); ctx.fill();
+    }
+    ctx.globalCompositeOperation='source-over';
 
-    // 上昇する気泡。壁の傷から立つので、湧く場所は数か所に固まる
+    // 6) 気泡。壁の傷から立つので、湧く口を数か所に固めて筋にする
     for(let i=bubblesFx.length-1;i>=0;i--){
       const bb=bubblesFx[i];
       bb.y-=bb.v/60; bb.t+=0.13;
@@ -2596,14 +2708,13 @@ function renderScene(now){
       const x=bb.x+Math.sin(bb.t)*bb.sw;
       ctx.fillStyle=`rgba(255,244,214,${bb.a})`;
       ctx.beginPath(); ctx.arc(x,bb.y,bb.r,0,Math.PI*2); ctx.fill();
-      if(bb.r>1.1){                                     // 大きい粒にだけ光を置く
+      if(bb.r>1.1){
         ctx.fillStyle='rgba(255,255,255,0.42)';
         ctx.beginPath(); ctx.arc(x-bb.r*0.28,bb.y-bb.r*0.32,bb.r*0.3,0,Math.PI*2); ctx.fill();
       }
     }
     if(botY-ys>12){
       const w0=hwAt(botY), half=(w0.R-w0.L)/2;
-      // 数を止めないと、1秒に100個以上たまって古い端末で重くなる
       const n=(s.Q>0?3:1);
       for(let k=0;k<n && bubblesFx.length<130;k++){
         if(Math.random()>0.42) continue;
@@ -2613,17 +2724,19 @@ function renderScene(now){
           a:0.26+Math.random()*0.26, t:Math.random()*6.3, sw:0.4+Math.random()*0.9});
       }
     }
-    // 液面のふち。表面張力でグラスに触れる縁が明るく光る
+    // 7) 液面。表面張力で縁が明るく光り、奥に光源の映り込みが出る
     if(fillP<0.01){
-      const w=hwAt(ys), ry=Math.max(ryAt(ys),0.1);
-      ctx.strokeStyle='rgba(255,236,186,0.42)'; ctx.lineWidth=1.4;
-      ctx.beginPath();
-      ctx.ellipse(w.C,ys,Math.max((w.R-w.L)/2,0.1),ry,0,0,Math.PI*2); ctx.stroke();
+      const w=hwAt(ys), rx=Math.max((w.R-w.L)/2,0.1), ry=Math.max(ryAt(ys),0.1);
+      ctx.strokeStyle='rgba(255,236,186,0.45)'; ctx.lineWidth=1.4;
+      ctx.beginPath(); ctx.ellipse(w.C,ys,rx,ry,0,0,Math.PI*2); ctx.stroke();
+      const hs=ctx.createRadialGradient(w.C-rx*0.3,ys-ry*0.3,0, w.C-rx*0.3,ys-ry*0.3,rx*0.45);
+      hs.addColorStop(0,'rgba(255,255,255,0.32)'); hs.addColorStop(1,'rgba(255,255,255,0)');
+      ctx.fillStyle=hs; ctx.beginPath(); ctx.ellipse(w.C,ys,rx,ry,0,0,Math.PI*2); ctx.fill();
     }
     ctx.restore();
   }
-  // 泡。平らな白い板が、写真の人物と並んだときいちばん浮く。
-  // きめ・上面の丸み・液との境目の3つを足して、クリームに見せる
+  // 泡。粒ごとに陰影のある泡を敷き詰め、上面は丸く盛り上げ、液との境目は
+  // ふぞろいにする。平らな白い帯がいちばん「絵」に見える
   if(fillP>0.004){
     ctx.save(); clipGlass(); ctx.clip();
     const yTop=Math.max(yP,topY);
@@ -2633,34 +2746,66 @@ function renderScene(now){
       surface(yL,-1);                  // 泡とビールの境目
       sideTo(yL,yTop,-1);
       ctx.closePath(); };
+    const wt=hwAt(yTop), wf=hwAt((yTop+yL)/2);
+    // 地のクリーム。上は光を受けて白く、液に近い側は黄みを帯びて影になる
     const fg=ctx.createLinearGradient(0,yTop,0,yL);
-    fg.addColorStop(0,   'rgba(255,252,243,0.97)');
-    fg.addColorStop(0.38,'rgba(247,236,216,0.96)');
-    fg.addColorStop(1,   'rgba(212,190,156,0.95)');   // 液に接する側は影になる
+    fg.addColorStop(0,   'rgba(255,251,240,0.98)');
+    fg.addColorStop(0.5, 'rgba(246,234,208,0.97)');
+    fg.addColorStop(1,   'rgba(214,186,140,0.96)');
     ctx.fillStyle=fg; foamPath(); ctx.fill();
-    // 泡の粒
+    // 泡の粒(2段階)。厚い泡ほど粒が見える
     ctx.save(); foamPath(); ctx.clip();
+    ctx.globalAlpha=clamp((yL-yTop)/14,0.3,0.72);
     ctx.fillStyle=foamPattern(ctx);
-    ctx.fillRect(hwAt(yTop).L-4,yTop-2,(hwAt(yTop).R-hwAt(yTop).L)+8,(yL-yTop)+4);
+    ctx.fillRect(wt.L-6,yTop-4,(wt.R-wt.L)+12,(yL-yTop)+8);
+    ctx.globalAlpha=1;
     ctx.restore();
+    // 液との境目。泡が液に食い込んでふぞろいになる
+    if(yL-yTop>5){
+      const w=hwAt(yL);
+      for(let i=0;i<9;i++){
+        const u=(i+0.5)/9, x=w.L+(w.R-w.L)*u;
+        const r=1.2+((i*7)%5)*0.45, dy=((i*3)%4)*0.6;
+        ctx.fillStyle='rgba(236,220,186,0.85)';
+        ctx.beginPath(); ctx.arc(x,yL+dy,r,0,Math.PI*2); ctx.fill();
+      }
+    }
     // 横の減光。泡もガラスの端では濃く見える
-    const wf=hwAt((yTop+yL)/2);
     const hf=ctx.createLinearGradient(wf.L,0,wf.R,0);
-    hf.addColorStop(0,   'rgba(120,104,82,0.26)');
-    hf.addColorStop(0.18,'rgba(120,104,82,0.02)');
+    hf.addColorStop(0,   'rgba(110,92,70,0.30)');
+    hf.addColorStop(0.16,'rgba(110,92,70,0.02)');
     hf.addColorStop(0.5, 'rgba(255,255,255,0.10)');
-    hf.addColorStop(0.84,'rgba(120,104,82,0.03)');
-    hf.addColorStop(1,   'rgba(120,104,82,0.28)');
+    hf.addColorStop(0.86,'rgba(110,92,70,0.03)');
+    hf.addColorStop(1,   'rgba(110,92,70,0.32)');
     ctx.fillStyle=hf; foamPath(); ctx.fill();
-    // 上面の丸み。手前の縁は下から見上げるぶん少し暗い
-    const w=hwAt(yTop), ry=Math.max(ryAt(yTop),0.1);
-    ctx.beginPath(); ctx.ellipse(w.C,yTop,Math.max((w.R-w.L)/2,0.1),ry,0,0,Math.PI*2);
+    // 上面。盛り上がって光を受ける。奥側が明るく、手前の縁は影
+    const rx=Math.max((wt.R-wt.L)/2,0.1), ry=Math.max(ryAt(yTop),0.1);
+    ctx.beginPath(); ctx.ellipse(wt.C,yTop,rx,ry,0,0,Math.PI*2);
     const dg=ctx.createLinearGradient(0,yTop-ry,0,yTop+ry);
-    dg.addColorStop(0,'rgba(255,255,255,0.30)');
-    dg.addColorStop(0.55,'rgba(255,252,244,0.06)');
-    dg.addColorStop(1,'rgba(186,168,142,0.26)');
+    dg.addColorStop(0,'rgba(255,255,255,0.42)');
+    dg.addColorStop(0.5,'rgba(255,252,244,0.10)');
+    dg.addColorStop(1,'rgba(176,156,126,0.30)');
     ctx.fillStyle=dg; ctx.fill();
+    const hs=ctx.createRadialGradient(wt.C-rx*0.35,yTop-ry*0.2,0, wt.C-rx*0.35,yTop-ry*0.2,rx*0.5);
+    hs.addColorStop(0,'rgba(255,255,255,0.36)'); hs.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.fillStyle=hs; ctx.beginPath(); ctx.ellipse(wt.C,yTop,rx,ry,0,0,Math.PI*2); ctx.fill();
+    // 上面からはみ出す大きめの泡。楕円が定規で引いた線に見えなくなる
+    for(let i=0;i<7;i++){
+      const u=0.08+0.84*(i/6), x=wt.L+(wt.R-wt.L)*u;
+      const r=0.9+((i*5)%4)*0.35;
+      const yy=yTop-ry*Math.sin(Math.PI*u)*0.9-r*0.5;
+      const bg=ctx.createRadialGradient(x-r*0.3,yy-r*0.3,0,x,yy,r);
+      bg.addColorStop(0,'rgba(255,255,255,0.95)'); bg.addColorStop(0.7,'rgba(246,238,222,0.9)');
+      bg.addColorStop(1,'rgba(180,160,130,0.5)');
+      ctx.fillStyle=bg; ctx.beginPath(); ctx.arc(x,yy,r,0,Math.PI*2); ctx.fill();
+    }
     ctx.restore();
+  }
+  // グラスを持っている指は液体より手前にある(オーナー指摘)。写真の指の
+  // 画素だけをマスクで切り出して、液体と泡の上に置き直す
+  if((fillL>0.004||fillP>0.004) && curScene){
+    const hl=handLayer(G.lvl.ch,img);
+    if(hl) ctx.drawImage(hl,dx,dy,dw,dh);
   }
   const F=(s.L+s.P)/s.C;
   // 満点の高さそのものを線で出す。縁を見下ろす角度で描かれた絵では、
@@ -2766,11 +2911,18 @@ function renderScene(now){
     sg.addColorStop(0.70,'rgba(230,152,40,0.94)');
     sg.addColorStop(1,   'rgba(146,82,12,0.88)');
     ctx.fillStyle=sg; stream(); ctx.fill();
-    // 落ち口。液が液を叩くところは白く泡立つ
-    ctx.fillStyle='rgba(255,250,238,0.5)';
+    // 落ち口。液が液を叩くところは白く泡立ち、細かい泡が跳ねる
+    ctx.fillStyle='rgba(255,250,238,0.42)';
     ctx.beginPath();
-    ctx.ellipse(lx, landY, sw*1.5+Math.sin(now/70)*1.4, 2.2+nf*1.5, 0, 0, Math.PI*2);
+    ctx.ellipse(lx, landY, sw*1.6+Math.sin(now/70)*1.4, 2.4+nf*1.6, 0, 0, Math.PI*2);
     ctx.fill();
+    for(let k=0;k<6;k++){
+      const ph=now/90+k*1.7;
+      const xx=lx+Math.cos(ph)*sw*(1.1+k*0.25), yy=landY-Math.abs(Math.sin(ph*0.7))*(2+nf*3);
+      const rr=1+((k*3)%3)*0.5;
+      ctx.fillStyle='rgba(255,252,244,0.75)';
+      ctx.beginPath(); ctx.arc(xx,yy,rr,0,Math.PI*2); ctx.fill();
+    }
     if(missing>0.05){
       // 入っていないことは、縁で弾けるしぶきで見せる。滴を飛ばすと
       // グラスの外に点が散らばって、描き損じに見える
@@ -3142,6 +3294,11 @@ updateHome();
 requestAnimationFrame(()=>{ resize(); });
 new ResizeObserver(resize).observe(el.cv);
 window.MI={G,Input,CFG,Save,judge,score,LEVELS,startLevel,FOAM_ORDERS,CHAR_ART,buildChara,CHARS,levelOf,exLevel,graceOf,bandOf,stopLag,Snd,Voice,VoiceClips};
+/* オフライン起動(仕様 §20)。Play ストア(TWA)配信の前提でもある。
+   file:// や対応外のブラウザでは黙って何もしない */
+if('serviceWorker' in navigator && location.protocol.startsWith('http')){
+  addEventListener('load',()=>{ navigator.serviceWorker.register('sw.js').catch(()=>{}); });
+}
 </script>
 <!-- /APP -->
 </body>
